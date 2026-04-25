@@ -15,6 +15,7 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta, time as dtime
 import time as _time
+import requests
 
 from config import (
     EMA_FAST,
@@ -28,6 +29,8 @@ from config import (
     NO_TRADE_BEFORE,
     NO_TRADE_AFTER,
     COOLDOWN_BARS,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
 )
 
 
@@ -330,6 +333,21 @@ def print_report(trades_df: pd.DataFrame, label: str, filter_stats: dict):
     print(f"\nSaved → {out_file}")
 
 
+def send_telegram(message: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            print(f"Telegram error: {resp.text}")
+    except Exception as e:
+        print(f"Telegram send failed: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", choices=["NIFTY", "BANKNIFTY", "BOTH"], default="BOTH")
@@ -338,6 +356,19 @@ def main():
     parser.add_argument("--start", default=None,
                         help="Start date YYYY-MM-DD (e.g. 2025-01-01). Downloads 15m data in chunks.")
     args = parser.parse_args()
+
+    # Send test notification for backtest
+    msg = (
+        "🧪 <b>BACKTEST RUNNING</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Mode: <code>Backtest Test Mode</code>\n"
+        f"Symbol: <code>{args.symbol}</code>\n"
+        f"Period: <code>{args.period if not args.start else args.start + ' to Today'}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>This is a test notification to verify Telegram alerts are working.</i>"
+    )
+    send_telegram(msg)
+    print("\n[Telegram] Sent test notification!")
 
     symbols = {
         "NIFTY": "^NSEI",
