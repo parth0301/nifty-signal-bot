@@ -9,7 +9,7 @@ import os
 # Step 1: Message @BotFather → /newbot → copy the token
 # Step 2: Message @userinfobot → copy your chat_id
 # ─────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8254456458: AAEIznbwNHKf-v7l3jDwgntuQNrGm9J07ek")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8254456458:AAEIznbwNHKf-v7l3jDwgntuQNrGm9J07ek")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "970123391")
 
 
@@ -38,8 +38,8 @@ SYMBOLS = [
 # ─────────────────────────────────────────────
 EMA_FAST        = 9       # Fast EMA period
 EMA_SLOW        = 20      # Slow EMA period
-ATR_PERIOD      = 7       # ATR period
-ATR_MULTIPLIER  = 2       # ATR multiplier for SL/bands
+# ATR_PERIOD      = 7       # ATR period
+# ATR_MULTIPLIER  = 2       # ATR multiplier for SL/bands
 MIN_RR_RATIO    = 1.5     # Minimum Risk:Reward to send alert
 
 
