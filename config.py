@@ -34,13 +34,48 @@ SYMBOLS = [
 
 
 # ─────────────────────────────────────────────
-# STRATEGY PARAMETERS  (your exact settings)
+# STRATEGY PARAMETERS
 # ─────────────────────────────────────────────
+
+# ── EMA Crossover ──
 EMA_FAST        = 9       # Fast EMA period
 EMA_SLOW        = 20      # Slow EMA period
-# ATR_PERIOD      = 7       # ATR period
-# ATR_MULTIPLIER  = 2       # ATR multiplier for SL/bands
 MIN_RR_RATIO    = 1.5     # Minimum Risk:Reward to send alert
+
+# ── Trend Filter (50 EMA slope) ──
+EMA_TREND       = 50      # Trend-direction EMA period
+TREND_SLOPE_BARS = 3      # Number of bars to check slope direction
+
+# ── RSI Confirmation ──
+RSI_PERIOD      = 14      # RSI lookback period
+RSI_BUY_MIN     = 55      # RSI must be ABOVE this for BUY signals
+RSI_SELL_MAX    = 45      # RSI must be BELOW this for SELL signals
+
+# ── Volume Spike Filter ──
+VOL_AVG_PERIOD  = 20      # Period for volume moving average
+VOL_SPIKE_MULT  = 1.2     # Volume must be >= this * avg to confirm signal
+
+# ── Candle Body Strength Filter ──
+# Crossover candle body must be >= this fraction of the total range (high-low)
+# Filters out weak doji/spinning-top candles that give false crossovers
+BODY_RATIO_MIN  = 0.40
+
+# ── ATR Expansion Filter ──
+# Current ATR must be > avg ATR of last N bars (market is actually moving)
+ATR_PERIOD      = 14      # ATR calculation period
+ATR_MULTIPLIER  = 2       # ATR multiplier for SL/target bands
+ATR_AVG_PERIOD  = 20      # Period for average ATR comparison
+ATR_EXPAND_MULT = 1.0     # Current ATR must be >= this * avg ATR
+
+# ── Time-of-Day Restrictions ──
+# Skip the chaotic opening and low-liquidity close
+NO_TRADE_BEFORE = (9, 30)   # No signals before 9:30 AM IST (skip first 15-min candle)
+NO_TRADE_AFTER  = (14, 45)  # No signals after 2:45 PM IST (avoid last-hour whipsaws)
+
+# ── Cooldown After SL ──
+# After a stop-loss hit, wait N candles before taking next signal on same symbol
+# Prevents whipsaw chains (e.g., 3 consecutive SLs in ranging market)
+COOLDOWN_BARS   = 3
 
 
 # ─────────────────────────────────────────────

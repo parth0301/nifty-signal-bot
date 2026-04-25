@@ -1,6 +1,8 @@
 """
 NIFTY / BANKNIFTY Options Signal Bot
-Strategy: 9 EMA / 20 EMA crossover + ATR(7, multiplier=2) for SL
+Strategy: 9 EMA / 20 EMA crossover + multi-filter confirmation + ATR-based SL
+Filters:  50 EMA trend, RSI, volume spike, candle body, ATR expansion,
+          time-of-day, cooldown after SL
 Timeframe: 15 minutes
 Data: yfinance (free, no API key)
 Alerts: Telegram
@@ -24,8 +26,21 @@ from config import (
     SYMBOLS,
     ATR_PERIOD,
     ATR_MULTIPLIER,
+    ATR_AVG_PERIOD,
+    ATR_EXPAND_MULT,
     EMA_FAST,
     EMA_SLOW,
+    EMA_TREND,
+    TREND_SLOPE_BARS,
+    RSI_PERIOD,
+    RSI_BUY_MIN,
+    RSI_SELL_MAX,
+    VOL_AVG_PERIOD,
+    VOL_SPIKE_MULT,
+    BODY_RATIO_MIN,
+    NO_TRADE_BEFORE,
+    NO_TRADE_AFTER,
+    COOLDOWN_BARS,
     SCAN_INTERVAL_SECONDS,
     MIN_RR_RATIO,
     MARKET_OPEN,
@@ -46,6 +61,9 @@ IST = pytz.timezone("Asia/Kolkata")
 
 # Track last signal per symbol to avoid duplicate alerts
 last_signal: dict[str, str] = {}
+
+# Track cooldown per symbol (number of candles to skip after SL)
+cooldown_remaining: dict[str, int] = {}
 
 
 # ─────────────────────────────────────────────
@@ -133,6 +151,18 @@ def compute_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 
+def compute_rsi(series: pd.Series, period: int) -> pd.Series:
+    """Wilder's RSI."""
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+
 def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
     tr = pd.concat([
@@ -145,15 +175,33 @@ def compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
+    # ── Core EMAs ──
     df["ema_fast"] = compute_ema(df["Close"], EMA_FAST)
     df["ema_slow"] = compute_ema(df["Close"], EMA_SLOW)
+    df["ema_trend"] = compute_ema(df["Close"], EMA_TREND)
+
+    # ── ATR ──
     df["atr"] = compute_atr(df, ATR_PERIOD)
+    df["atr_avg"] = df["atr"].rolling(ATR_AVG_PERIOD).mean()
 
     # ATR-based dynamic SL bands
     df["atr_upper"] = df["Close"] + ATR_MULTIPLIER * df["atr"]
     df["atr_lower"] = df["Close"] - ATR_MULTIPLIER * df["atr"]
 
-    # Crossover detection
+    # ── RSI ──
+    df["rsi"] = compute_rsi(df["Close"], RSI_PERIOD)
+
+    # ── Volume moving average ──
+    df["vol_avg"] = df["Volume"].rolling(VOL_AVG_PERIOD).mean()
+
+    # ── Candle body ratio = |close - open| / (high - low) ──
+    candle_range = df["High"] - df["Low"]
+    candle_range = candle_range.replace(0, np.nan)
+    df["body_ratio"] = (df["Close"] - df["Open"]).abs() / candle_range
+    df["body_ratio"] = df["body_ratio"].fillna(0)
+
+    # ── Crossover detection ──
     df["cross_up"] = (df["ema_fast"] > df["ema_slow"]) & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1))
     df["cross_down"] = (df["ema_fast"] < df["ema_slow"]) & (df["ema_fast"].shift(1) >= df["ema_slow"].shift(1))
 
@@ -161,56 +209,165 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
+# FILTER CHECKS
+# ─────────────────────────────────────────────
+
+def passes_time_filter(candle_time) -> bool:
+    """No trades during the first 15-min candle or after the cutoff."""
+    t = candle_time.time() if hasattr(candle_time, "time") else candle_time
+    if t < dtime(*NO_TRADE_BEFORE):
+        return False
+    if t > dtime(*NO_TRADE_AFTER):
+        return False
+    return True
+
+
+def passes_trend_filter(df: pd.DataFrame, direction: str) -> bool:
+    """
+    50 EMA must be sloping in the signal direction over the last N bars.
+    BUY → 50 EMA rising; SELL → 50 EMA falling.
+    """
+    ema_vals = df["ema_trend"].iloc[-(TREND_SLOPE_BARS + 1):]
+    if len(ema_vals) < TREND_SLOPE_BARS + 1:
+        return False
+
+    slope = ema_vals.iloc[-1] - ema_vals.iloc[0]
+    if direction == "BUY" and slope <= 0:
+        return False
+    if direction == "SELL" and slope >= 0:
+        return False
+    return True
+
+
+def passes_rsi_filter(rsi_value: float, direction: str) -> bool:
+    """RSI must confirm momentum direction."""
+    if direction == "BUY" and rsi_value < RSI_BUY_MIN:
+        return False
+    if direction == "SELL" and rsi_value > RSI_SELL_MAX:
+        return False
+    return True
+
+
+def passes_volume_filter(current_vol: float, avg_vol: float) -> bool:
+    """Volume must be above average * multiplier."""
+    if pd.isna(avg_vol) or avg_vol == 0:
+        return True  # not enough data — let it through
+    return current_vol >= VOL_SPIKE_MULT * avg_vol
+
+
+def passes_body_filter(body_ratio: float) -> bool:
+    """Crossover candle must have a strong body (not a doji)."""
+    return body_ratio >= BODY_RATIO_MIN
+
+
+def passes_atr_expansion(current_atr: float, avg_atr: float) -> bool:
+    """Market must be moving — ATR above its own average."""
+    if pd.isna(avg_atr) or avg_atr == 0:
+        return True
+    return current_atr >= ATR_EXPAND_MULT * avg_atr
+
+
+# ─────────────────────────────────────────────
 # SIGNAL LOGIC
 # ─────────────────────────────────────────────
 
-def evaluate_signal(df: pd.DataFrame) -> dict | None:
+def evaluate_signal(df: pd.DataFrame, label: str = "") -> dict | None:
     """
-    Returns signal dict if a fresh crossover is detected on the latest candle.
+    Returns signal dict if a fresh crossover is detected on the latest candle
+    AND all quality filters pass.
     """
-    if len(df) < EMA_SLOW + 5:
+    if len(df) < EMA_TREND + 10:
         return None
 
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
     close = latest["Close"]
     atr = latest["atr"]
+    atr_avg = latest["atr_avg"]
     ema_fast = latest["ema_fast"]
     ema_slow = latest["ema_slow"]
+    rsi = latest["rsi"]
+    vol = latest["Volume"]
+    vol_avg = latest["vol_avg"]
+    body_ratio = latest["body_ratio"]
+    candle_time = df.index[-1]
 
-    # Trend strength: % gap between EMAs
-    ema_gap_pct = abs(ema_fast - ema_slow) / ema_slow * 100
-
-    signal = None
-    direction = None
-
+    # ── Determine raw crossover direction ──
     if latest["cross_up"]:
-        signal = "BUY"
-        direction = "BULLISH"
-        sl = close - (ATR_MULTIPLIER * atr)
-        target1 = close + (ATR_MULTIPLIER * atr * 1.5)
-        target2 = close + (ATR_MULTIPLIER * atr * 2.5)
+        direction = "BUY"
         option_type = "CE"
     elif latest["cross_down"]:
-        signal = "SELL"
-        direction = "BEARISH"
-        sl = close + (ATR_MULTIPLIER * atr)
-        target1 = close - (ATR_MULTIPLIER * atr * 1.5)
-        target2 = close - (ATR_MULTIPLIER * atr * 2.5)
+        direction = "SELL"
         option_type = "PE"
     else:
         return None
+
+    # ══════════════════════════════════════════
+    # QUALITY FILTERS — each must pass
+    # ══════════════════════════════════════════
+
+    # 1. Time-of-day filter
+    if not passes_time_filter(candle_time):
+        log.info(f"{label}: {direction} skipped — outside trading window ({candle_time})")
+        return None
+
+    # 2. Cooldown after SL
+    cd = cooldown_remaining.get(label, 0)
+    if cd > 0:
+        cooldown_remaining[label] = cd - 1
+        log.info(f"{label}: {direction} skipped — cooldown ({cd} bars remaining)")
+        return None
+
+    # 3. Trend filter (50 EMA slope)
+    if not passes_trend_filter(df, direction):
+        log.info(f"{label}: {direction} skipped — 50 EMA slope disagrees")
+        return None
+
+    # 4. RSI confirmation
+    if not passes_rsi_filter(rsi, direction):
+        log.info(f"{label}: {direction} skipped — RSI {rsi:.1f} out of range")
+        return None
+
+    # 5. Volume spike
+    if not passes_volume_filter(vol, vol_avg):
+        log.info(f"{label}: {direction} skipped — volume too low ({vol:.0f} vs avg {vol_avg:.0f})")
+        return None
+
+    # 6. Candle body strength
+    if not passes_body_filter(body_ratio):
+        log.info(f"{label}: {direction} skipped — weak candle body ({body_ratio:.2f})")
+        return None
+
+    # 7. ATR expansion
+    if not passes_atr_expansion(atr, atr_avg):
+        log.info(f"{label}: {direction} skipped — ATR not expanding ({atr:.2f} vs avg {atr_avg:.2f})")
+        return None
+
+    # ══════════════════════════════════════════
+    # ALL FILTERS PASSED — build the signal
+    # ══════════════════════════════════════════
+
+    if direction == "BUY":
+        sl = close - (ATR_MULTIPLIER * atr)
+        target1 = close + (ATR_MULTIPLIER * atr * 1.5)
+        target2 = close + (ATR_MULTIPLIER * atr * 2.5)
+    else:
+        sl = close + (ATR_MULTIPLIER * atr)
+        target1 = close - (ATR_MULTIPLIER * atr * 1.5)
+        target2 = close - (ATR_MULTIPLIER * atr * 2.5)
 
     risk = abs(close - sl)
     reward1 = abs(close - target1)
     rr1 = reward1 / risk if risk > 0 else 0
 
     if rr1 < MIN_RR_RATIO:
-        log.info(f"Signal {signal} skipped — RR {rr1:.2f} below minimum {MIN_RR_RATIO}")
+        log.info(f"{label}: {direction} skipped — RR {rr1:.2f} below minimum {MIN_RR_RATIO}")
         return None
 
+    # Trend strength: % gap between EMAs
+    ema_gap_pct = abs(ema_fast - ema_slow) / ema_slow * 100
+
     # Signal strength
-    if ema_gap_pct > 0.3 and atr > df["atr"].rolling(20).mean().iloc[-1]:
+    if ema_gap_pct > 0.3 and atr > atr_avg:
         strength = "STRONG 🔥"
     elif ema_gap_pct > 0.15:
         strength = "MODERATE ✅"
@@ -218,8 +375,8 @@ def evaluate_signal(df: pd.DataFrame) -> dict | None:
         strength = "WEAK ⚠️"
 
     return {
-        "signal": signal,
-        "direction": direction,
+        "signal": direction,
+        "direction": "BULLISH" if direction == "BUY" else "BEARISH",
         "option_type": option_type,
         "close": close,
         "sl": sl,
@@ -231,8 +388,9 @@ def evaluate_signal(df: pd.DataFrame) -> dict | None:
         "ema_fast": ema_fast,
         "ema_slow": ema_slow,
         "ema_gap_pct": ema_gap_pct,
+        "rsi": rsi,
         "strength": strength,
-        "candle_time": df.index[-1],
+        "candle_time": candle_time,
     }
 
 
@@ -274,6 +432,12 @@ def format_signal_message(sym_label: str, sig: dict, options: dict) -> str:
 
     ts = sig["candle_time"].strftime("%d %b %Y  %H:%M IST")
 
+    # Filter summary for transparency
+    filter_line = (
+        f"\n📐 RSI: <code>{sig['rsi']:.1f}</code> | "
+        f"Body: <code>{sig['strength']}</code>"
+    )
+
     msg = (
         f"{arrow} <b>{sig['signal']} SIGNAL — {sym_label}</b> {arrow}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -281,13 +445,14 @@ def format_signal_message(sym_label: str, sig: dict, options: dict) -> str:
         f"📊 Timeframe: 15 Min\n"
         f"📈 Direction: <b>{sig['direction']}</b>\n"
         f"💡 Signal Strength: {sig['strength']}\n"
+        f"{filter_line}\n"
         f"\n<b>🎯 Entry Zone</b>\n"
         f"Spot Price: <code>₹{sig['close']:,.2f}</code>\n"
         f"9 EMA: <code>₹{sig['ema_fast']:,.2f}</code>\n"
         f"20 EMA: <code>₹{sig['ema_slow']:,.2f}</code>\n"
         f"EMA Gap: <code>{sig['ema_gap_pct']:.2f}%</code>\n"
         f"\n<b>🛡 Risk Management (ATR-based)</b>\n"
-        f"ATR(7): <code>{sig['atr']:,.2f}</code>\n"
+        f"ATR({ATR_PERIOD}): <code>{sig['atr']:,.2f}</code>\n"
         f"Stop Loss: <code>₹{sig['sl']:,.2f}</code>\n"
         f"Target 1: <code>₹{sig['target1']:,.2f}</code>  (RR 1:{sig['rr1']:.1f})\n"
         f"Target 2: <code>₹{sig['target2']:,.2f}</code>  (RR 1:{sig['rr2']:.1f})\n"
@@ -304,13 +469,14 @@ def send_startup_message():
     msg = (
         "🤖 <b>NIFTY Signal Bot is LIVE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Strategy: <code>9 EMA / 20 EMA + ATR(7, x2)</code>\n"
+        "Strategy: <code>9/20 EMA Crossover + 7 Filters</code>\n"
+        "Filters: <code>50EMA Trend | RSI | Volume | Body | ATR | Time | Cooldown</code>\n"
         "Timeframe: <code>15 Minutes</code>\n"
         "Instruments: <code>NIFTY | BANKNIFTY</code>\n"
         "Market Hours: <code>09:15 – 15:25 IST</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Scanning every 5 minutes during market hours.\n"
-        "Signals sent here automatically. You decide entry. 🎯"
+        "Only high-conviction signals sent. 🎯"
     )
     send_telegram(msg)
 
@@ -344,7 +510,7 @@ def run_scan():
             continue
 
         df = add_indicators(df)
-        sig = evaluate_signal(df)
+        sig = evaluate_signal(df, label)
 
         if sig is None:
             log.info(f"{label}: No signal")
