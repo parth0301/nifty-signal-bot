@@ -1,9 +1,9 @@
 """
-Backtest — 9 EMA / 20 EMA + ATR(7, x2) strategy
+Backtest — EMA Crossover Strategy (No ATR)
 Usage:
-    python backtest.py               → backtests both NIFTY and BANKNIFTY
+    python backtest.py
     python backtest.py --symbol NIFTY
-    python backtest.py --period 60d  → use 60 days of data
+    python backtest.py --period 60d
 """
 
 import argparse
@@ -12,8 +12,8 @@ import numpy as np
 import yfinance as yf
 from datetime import datetime
 
-# ── reuse indicator logic from bot ────────────────────────
-from config import EMA_FAST, EMA_SLOW, ATR_PERIOD, ATR_MULTIPLIER, MIN_RR_RATIO
+# ── config ────────────────────────
+from config import EMA_FAST, EMA_SLOW, MIN_RR_RATIO
 
 
 def fetch(yf_symbol: str, period: str = "60d", interval: str = "15m") -> pd.DataFrame:
@@ -24,18 +24,16 @@ def fetch(yf_symbol: str, period: str = "60d", interval: str = "15m") -> pd.Data
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ema9"]  = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema20"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    df["ema_fast"] = df["Close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema_slow"] = df["Close"].ewm(span=EMA_SLOW, adjust=False).mean()
 
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - df["Close"].shift(1)).abs(),
-        (df["Low"]  - df["Close"].shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
+    df["cross_up"] = (df["ema_fast"] > df["ema_slow"]) & (
+        df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)
+    )
+    df["cross_down"] = (df["ema_fast"] < df["ema_slow"]) & (
+        df["ema_fast"].shift(1) >= df["ema_slow"].shift(1)
+    )
 
-    df["cross_up"]   = (df["ema9"] > df["ema20"]) & (df["ema9"].shift(1) <= df["ema20"].shift(1))
-    df["cross_down"] = (df["ema9"] < df["ema20"]) & (df["ema9"].shift(1) >= df["ema20"].shift(1))
     return df
 
 
@@ -46,18 +44,19 @@ def backtest(df: pd.DataFrame, label: str) -> pd.DataFrame:
     while i < len(df):
         row = df.iloc[i]
         close = row["Close"]
-        atr   = row["atr"]
 
         if row["cross_up"]:
-            direction  = "BUY"
-            sl         = close - ATR_MULTIPLIER * atr
-            target1    = close + ATR_MULTIPLIER * atr * 1.5
-            target2    = close + ATR_MULTIPLIER * atr * 2.5
+            direction = "BUY"
+            sl = close * 0.997      # 0.3% SL
+            target1 = close * 1.006 # 0.6%
+            target2 = close * 1.012 # 1.2%
+
         elif row["cross_down"]:
-            direction  = "SELL"
-            sl         = close + ATR_MULTIPLIER * atr
-            target1    = close - ATR_MULTIPLIER * atr * 1.5
-            target2    = close - ATR_MULTIPLIER * atr * 2.5
+            direction = "SELL"
+            sl = close * 1.003
+            target1 = close * 0.994
+            target2 = close * 0.988
+
         else:
             i += 1
             continue
@@ -66,82 +65,92 @@ def backtest(df: pd.DataFrame, label: str) -> pd.DataFrame:
         if risk == 0:
             i += 1
             continue
+
         rr1 = abs(close - target1) / risk
         if rr1 < MIN_RR_RATIO:
             i += 1
             continue
 
-        # Simulate outcome: walk forward candles until SL or Target hit
+        # Trade simulation
         entry_price = close
-        entry_time  = df.index[i]
-        outcome     = "OPEN"
-        exit_price  = None
-        exit_time   = None
-        pnl_pts     = None
+        entry_time = df.index[i]
 
-        for j in range(i + 1, min(i + 40, len(df))):  # max 40 candles forward
+        outcome = "OPEN"
+        exit_price = None
+        exit_time = None
+        pnl_pts = None
+
+        for j in range(i + 1, min(i + 40, len(df))):
             future = df.iloc[j]
+
             if direction == "BUY":
                 if future["Low"] <= sl:
-                    outcome    = "SL_HIT"
+                    outcome = "SL_HIT"
                     exit_price = sl
-                    exit_time  = df.index[j]
-                    pnl_pts    = sl - entry_price
+                    exit_time = df.index[j]
+                    pnl_pts = sl - entry_price
                     break
+
                 elif future["High"] >= target2:
-                    outcome    = "T2_HIT"
+                    outcome = "T2_HIT"
                     exit_price = target2
-                    exit_time  = df.index[j]
-                    pnl_pts    = target2 - entry_price
+                    exit_time = df.index[j]
+                    pnl_pts = target2 - entry_price
                     break
+
                 elif future["High"] >= target1:
-                    outcome    = "T1_HIT"
+                    outcome = "T1_HIT"
                     exit_price = target1
-                    exit_time  = df.index[j]
-                    pnl_pts    = target1 - entry_price
+                    exit_time = df.index[j]
+                    pnl_pts = target1 - entry_price
                     break
+
             else:  # SELL
                 if future["High"] >= sl:
-                    outcome    = "SL_HIT"
+                    outcome = "SL_HIT"
                     exit_price = sl
-                    exit_time  = df.index[j]
-                    pnl_pts    = entry_price - sl
+                    exit_time = df.index[j]
+                    pnl_pts = entry_price - sl
                     break
+
                 elif future["Low"] <= target2:
-                    outcome    = "T2_HIT"
+                    outcome = "T2_HIT"
                     exit_price = target2
-                    exit_time  = df.index[j]
-                    pnl_pts    = entry_price - target2
+                    exit_time = df.index[j]
+                    pnl_pts = entry_price - target2
                     break
+
                 elif future["Low"] <= target1:
-                    outcome    = "T1_HIT"
+                    outcome = "T1_HIT"
                     exit_price = target1
-                    exit_time  = df.index[j]
-                    pnl_pts    = entry_price - target1
+                    exit_time = df.index[j]
+                    pnl_pts = entry_price - target1
                     break
 
         if outcome == "OPEN":
             exit_price = df.iloc[min(i + 40, len(df) - 1)]["Close"]
-            exit_time  = df.index[min(i + 40, len(df) - 1)]
-            pnl_pts    = (exit_price - entry_price) if direction == "BUY" else (entry_price - exit_price)
+            exit_time = df.index[min(i + 40, len(df) - 1)]
+            pnl_pts = (
+                exit_price - entry_price
+                if direction == "BUY"
+                else entry_price - exit_price
+            )
 
         trades.append({
-            "symbol":      label,
-            "direction":   direction,
-            "entry_time":  entry_time,
+            "symbol": label,
+            "direction": direction,
+            "entry_time": entry_time,
             "entry_price": round(entry_price, 2),
-            "sl":          round(sl, 2),
-            "target1":     round(target1, 2),
-            "target2":     round(target2, 2),
-            "rr1":         round(rr1, 2),
-            "atr":         round(atr, 2),
-            "outcome":     outcome,
-            "exit_price":  round(exit_price, 2) if exit_price else None,
-            "exit_time":   exit_time,
-            "pnl_pts":     round(pnl_pts, 2) if pnl_pts else 0,
+            "sl": round(sl, 2),
+            "target1": round(target1, 2),
+            "target2": round(target2, 2),
+            "rr1": round(rr1, 2),
+            "outcome": outcome,
+            "exit_price": round(exit_price, 2) if exit_price else None,
+            "exit_time": exit_time,
+            "pnl_pts": round(pnl_pts, 2) if pnl_pts else 0,
         })
 
-        # Skip ahead past this trade
         i = df.index.get_loc(exit_time) + 1 if exit_time in df.index else i + 1
 
     return pd.DataFrame(trades)
@@ -152,79 +161,61 @@ def print_report(trades_df: pd.DataFrame, label: str):
         print(f"\n{label}: No trades found.")
         return
 
-    total     = len(trades_df)
-    wins      = trades_df[trades_df["pnl_pts"] > 0]
-    losses    = trades_df[trades_df["pnl_pts"] <= 0]
-    win_rate  = len(wins) / total * 100
+    total = len(trades_df)
+    wins = trades_df[trades_df["pnl_pts"] > 0]
+    losses = trades_df[trades_df["pnl_pts"] <= 0]
+
+    win_rate = len(wins) / total * 100
     total_pnl = trades_df["pnl_pts"].sum()
-    avg_win   = wins["pnl_pts"].mean() if not wins.empty else 0
-    avg_loss  = losses["pnl_pts"].mean() if not losses.empty else 0
-    t1_hits   = len(trades_df[trades_df["outcome"] == "T1_HIT"])
-    t2_hits   = len(trades_df[trades_df["outcome"] == "T2_HIT"])
-    sl_hits   = len(trades_df[trades_df["outcome"] == "SL_HIT"])
-    best      = trades_df["pnl_pts"].max()
-    worst     = trades_df["pnl_pts"].min()
 
-    # Profit factor
-    gross_profit = wins["pnl_pts"].sum() if not wins.empty else 0
-    gross_loss   = abs(losses["pnl_pts"].sum()) if not losses.empty else 1
-    pf           = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+    avg_win = wins["pnl_pts"].mean() if not wins.empty else 0
+    avg_loss = losses["pnl_pts"].mean() if not losses.empty else 0
 
-    # Max drawdown (cumulative PnL)
+    pf = (wins["pnl_pts"].sum()) / abs(losses["pnl_pts"].sum()) if not losses.empty else float("inf")
+
     cumulative = trades_df["pnl_pts"].cumsum()
-    roll_max   = cumulative.cummax()
-    drawdown   = (cumulative - roll_max)
-    max_dd     = drawdown.min()
+    max_dd = (cumulative - cumulative.cummax()).min()
 
-    sep = "=" * 52
-    print(f"\n{sep}")
-    print(f"  BACKTEST REPORT — {label}")
-    print(f"  Strategy: {EMA_FAST}/{EMA_SLOW} EMA + ATR({ATR_PERIOD}, x{ATR_MULTIPLIER})")
-    print(f"  Timeframe: 15 Minutes")
-    print(sep)
-    print(f"  Total Trades      : {total}")
-    print(f"  Win Rate          : {win_rate:.1f}%")
-    print(f"  Profit Factor     : {pf:.2f}")
-    print(f"  Total PnL (pts)   : {total_pnl:+.2f}")
-    print(f"  Avg Win (pts)     : {avg_win:+.2f}")
-    print(f"  Avg Loss (pts)    : {avg_loss:+.2f}")
-    print(f"  Best Trade (pts)  : {best:+.2f}")
-    print(f"  Worst Trade (pts) : {worst:+.2f}")
-    print(f"  Max Drawdown(pts) : {max_dd:+.2f}")
-    print(f"  T1 Hits           : {t1_hits}  |  T2 Hits: {t2_hits}  |  SL Hits: {sl_hits}")
-    print(sep)
+    print("\n" + "=" * 50)
+    print(f"BACKTEST REPORT — {label}")
+    print(f"Strategy: {EMA_FAST}/{EMA_SLOW} EMA Crossover")
+    print("=" * 50)
 
-    # Last 10 trades
-    print(f"\n  Last {min(10, total)} Trades:")
-    display_cols = ["entry_time", "direction", "entry_price", "sl", "target1", "outcome", "pnl_pts"]
-    print(trades_df[display_cols].tail(10).to_string(index=False))
-    print()
+    print(f"Total Trades   : {total}")
+    print(f"Win Rate       : {win_rate:.2f}%")
+    print(f"Profit Factor  : {pf:.2f}")
+    print(f"Total PnL      : {total_pnl:.2f}")
+    print(f"Max Drawdown   : {max_dd:.2f}")
 
-    # Save full results
-    out_file = f"backtest_{label.replace(' ', '_')}.csv"
+    print("\nLast 10 Trades:")
+    print(trades_df.tail(10).to_string(index=False))
+
+    out_file = f"backtest_{label}.csv"
     trades_df.to_csv(out_file, index=False)
-    print(f"  Full results saved → {out_file}")
+    print(f"\nSaved → {out_file}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", choices=["NIFTY", "BANKNIFTY", "BOTH"], default="BOTH")
-    parser.add_argument("--period", default="60d", help="e.g. 30d, 60d (max 60d for 15m data)")
+    parser.add_argument("--period", default="60d")
     args = parser.parse_args()
 
     symbols = {
-        "NIFTY":     "^NSEI",
+        "NIFTY": "^NSEI",
         "BANKNIFTY": "^NSEBANK",
     }
 
     targets = list(symbols.items()) if args.symbol == "BOTH" else [(args.symbol, symbols[args.symbol])]
 
     for label, yf_sym in targets:
-        print(f"\nFetching {label} ({args.period})...")
+        print(f"\nFetching {label}...")
         df = fetch(yf_sym, period=args.period)
+
         if df.empty:
-            print(f"  No data for {label}. Skipping.")
+            print(f"No data for {label}")
             continue
+
         df = add_indicators(df)
         trades = backtest(df, label)
         print_report(trades, label)
