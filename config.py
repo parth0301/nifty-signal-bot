@@ -34,48 +34,32 @@ SYMBOLS = [
 
 
 # ─────────────────────────────────────────────
-# STRATEGY PARAMETERS
+# STRATEGY PARAMETERS  (9/20 EMA Crossover)
 # ─────────────────────────────────────────────
-
-# ── EMA Crossover ──
 EMA_FAST        = 9       # Fast EMA period
 EMA_SLOW        = 20      # Slow EMA period
-MIN_RR_RATIO    = 1.5     # Minimum Risk:Reward to send alert
 
-# ── Trend Filter (50 EMA slope) ──
-EMA_TREND       = 50      # Trend-direction EMA period
-TREND_SLOPE_BARS = 3      # Number of bars to check slope direction
+# ── SL / TARGET (% based — asymmetric for high WR) ──
+# KEY INSIGHT: Target CLOSER than SL → higher win rate
+# Old was: SL=0.3%, T1=0.6% → target 2x farther than SL → 43% WR
+# New is:  SL=0.5%, T1=0.25% → target HALF of SL → ~75% WR
+SL_PCT          = 0.005   # 0.5% stop loss (wider = harder to get stopped)
+T1_PCT          = 0.0025  # 0.25% target 1 (close = easy to hit)
+T2_PCT          = 0.005   # 0.5% target 2 (same as SL distance)
 
-# ── RSI Confirmation ──
-RSI_PERIOD      = 14      # RSI lookback period
-RSI_BUY_MIN     = 55      # RSI must be ABOVE this for BUY signals
-RSI_SELL_MAX    = 45      # RSI must be BELOW this for SELL signals
+# ── Trend Filter (50 EMA) ──
+EMA_TREND       = 50      # Only trade in direction of 50 EMA slope
+TREND_BARS      = 5       # Check slope over 5 bars
 
-# ── Volume Spike Filter ──
-VOL_AVG_PERIOD  = 20      # Period for volume moving average
-VOL_SPIKE_MULT  = 1.2     # Volume must be >= this * avg to confirm signal
+# ── Time-of-Day ──
+NO_TRADE_BEFORE = (9, 30)   # Skip 9:15 opening candle
+NO_TRADE_AFTER  = (15, 0)   # No signals after 3:00 PM
 
-# ── Candle Body Strength Filter ──
-# Crossover candle body must be >= this fraction of the total range (high-low)
-# Filters out weak doji/spinning-top candles that give false crossovers
-BODY_RATIO_MIN  = 0.40
+# ── Cooldown ──
+COOLDOWN_BARS   = 2       # Wait 2 bars after SL hit
 
-# ── ATR Expansion Filter ──
-# Current ATR must be > avg ATR of last N bars (market is actually moving)
-ATR_PERIOD      = 14      # ATR calculation period
-ATR_MULTIPLIER  = 2       # ATR multiplier for SL/target bands
-ATR_AVG_PERIOD  = 20      # Period for average ATR comparison
-ATR_EXPAND_MULT = 1.0     # Current ATR must be >= this * avg ATR
-
-# ── Time-of-Day Restrictions ──
-# Skip the chaotic opening and low-liquidity close
-NO_TRADE_BEFORE = (9, 30)   # No signals before 9:30 AM IST (skip first 15-min candle)
-NO_TRADE_AFTER  = (14, 45)  # No signals after 2:45 PM IST (avoid last-hour whipsaws)
-
-# ── Cooldown After SL ──
-# After a stop-loss hit, wait N candles before taking next signal on same symbol
-# Prevents whipsaw chains (e.g., 3 consecutive SLs in ranging market)
-COOLDOWN_BARS   = 3
+# ── Min RR (low because we're trading WR for RR) ──
+MIN_RR_RATIO    = 0.4     # T1/SL = 0.25/0.5 = 0.5, so min 0.4 passes
 
 
 # ─────────────────────────────────────────────
