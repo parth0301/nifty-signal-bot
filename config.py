@@ -65,6 +65,6 @@ MIN_RR_RATIO    = 0.4     # T1/SL = 0.25/0.5 = 0.5, so min 0.4 passes
 # ─────────────────────────────────────────────
 # TIMING
 # ─────────────────────────────────────────────
-SCAN_INTERVAL_SECONDS = 5 * 60   # Scan every 5 minutes
+SCAN_INTERVAL_SECONDS = 5        # Scan every 5 seconds (fast detection)
 MARKET_OPEN           = (9, 15)  # 9:15 AM IST
 MARKET_CLOSE          = (15, 25) # 3:25 PM IST (5 min before square-off)

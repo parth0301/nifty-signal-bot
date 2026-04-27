@@ -39,7 +39,7 @@ from config import (
 )
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
@@ -51,7 +51,8 @@ log = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 # Track last signal per symbol to avoid duplicate alerts
-last_signal: dict[str, str] = {}
+# Key: symbol label, Value: candle_time of last signal sent
+last_signal_time: dict[str, str] = {}
 
 # Track cooldown per symbol
 cooldown_remaining: dict[str, int] = {}
@@ -62,7 +63,11 @@ cooldown_remaining: dict[str, int] = {}
 # ─────────────────────────────────────────────
 
 def fetch_ohlcv(symbol: str, period: str = "5d", interval: str = "15m") -> pd.DataFrame:
-    """Fetch OHLCV data from yfinance."""
+    """
+    Fetch OHLCV data from yfinance.
+    IMPORTANT: The last row from yfinance is the CURRENTLY FORMING candle.
+    We drop it to only work with COMPLETED candles.
+    """
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=period, interval=interval)
@@ -72,6 +77,16 @@ def fetch_ohlcv(symbol: str, period: str = "5d", interval: str = "15m") -> pd.Da
         df.index = df.index.tz_convert(IST)
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.dropna(inplace=True)
+
+        # Drop the last row — it's the LIVE (incomplete) candle.
+        # EMA values on an incomplete candle are unreliable and cause
+        # crossovers to appear/disappear mid-candle.
+        if len(df) > 1:
+            live_candle_time = df.index[-1]
+            df = df.iloc[:-1]
+            log.debug(f"{symbol}: Dropped live candle at {live_candle_time}, "
+                      f"last completed candle: {df.index[-1]}")
+
         return df
     except Exception as e:
         log.error(f"Error fetching {symbol}: {e}")
@@ -161,95 +176,123 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def evaluate_signal(df: pd.DataFrame, label: str = "") -> dict | None:
     """
-    Returns signal dict if EMA crossover + 50 EMA trend agrees.
-    Only 3 filters: time, trend, cooldown.
+    Scans the last 3 COMPLETED candles for an EMA crossover.
+    Returns signal dict if crossover + 50 EMA trend agrees.
+    Checks multiple candles to avoid missing signals between scans.
     """
     if len(df) < EMA_TREND + 10:
+        log.debug(f"{label}: Not enough data ({len(df)} candles, need {EMA_TREND + 10})")
         return None
 
+    # Log the current EMA state for debugging
     latest = df.iloc[-1]
-    close = latest["Close"]
-    ema_fast = latest["ema_fast"]
-    ema_slow = latest["ema_slow"]
-    candle_time = df.index[-1]
+    log.debug(
+        f"{label} EMA STATE | Close: {latest['Close']:.2f} | "
+        f"EMA{EMA_FAST}: {latest['ema_fast']:.2f} | "
+        f"EMA{EMA_SLOW}: {latest['ema_slow']:.2f} | "
+        f"EMA{EMA_TREND}: {latest['ema_trend']:.2f} | "
+        f"Fast>Slow: {latest['ema_fast'] > latest['ema_slow']} | "
+        f"CrossUp: {latest['cross_up']} | CrossDown: {latest['cross_down']}"
+    )
 
-    # ── Crossover detection ──
-    if latest["cross_up"]:
-        direction = "BUY"
-        option_type = "CE"
-    elif latest["cross_down"]:
-        direction = "SELL"
-        option_type = "PE"
-    else:
-        return None
+    # Check the last 3 completed candles for crossovers (most recent first)
+    lookback = min(3, len(df))
+    for offset in range(lookback):
+        idx = len(df) - 1 - offset
+        row = df.iloc[idx]
+        candle_time = df.index[idx]
 
-    # ── FILTER 1: Time-of-day ──
-    t = candle_time.time() if hasattr(candle_time, "time") else candle_time
-    if t < dtime(*NO_TRADE_BEFORE) or t > dtime(*NO_TRADE_AFTER):
-        log.info(f"{label}: {direction} skipped — outside trading window")
-        return None
+        if row["cross_up"]:
+            direction = "BUY"
+            option_type = "CE"
+        elif row["cross_down"]:
+            direction = "SELL"
+            option_type = "PE"
+        else:
+            continue
 
-    # ── FILTER 2: Cooldown ──
-    cd = cooldown_remaining.get(label, 0)
-    if cd > 0:
-        cooldown_remaining[label] = cd - 1
-        log.info(f"{label}: {direction} skipped — cooldown ({cd} bars left)")
-        return None
+        log.info(f"{label}: Crossover {direction} detected on candle {candle_time} (offset={offset})")
 
-    # ── FILTER 3: 50 EMA trend ──
-    ema_trend_vals = df["ema_trend"].iloc[-(TREND_BARS + 1):]
-    if len(ema_trend_vals) >= 2:
-        slope = ema_trend_vals.iloc[-1] - ema_trend_vals.iloc[0]
-        if direction == "BUY" and slope <= 0:
-            log.info(f"{label}: BUY skipped — 50 EMA trending down")
-            return None
-        if direction == "SELL" and slope >= 0:
-            log.info(f"{label}: SELL skipped — 50 EMA trending up")
-            return None
+        close = row["Close"]
+        ema_fast = row["ema_fast"]
+        ema_slow = row["ema_slow"]
 
-    # ── Build signal (asymmetric SL/targets) ──
-    if direction == "BUY":
-        sl = close * (1 - SL_PCT)
-        target1 = close * (1 + T1_PCT)
-        target2 = close * (1 + T2_PCT)
-    else:
-        sl = close * (1 + SL_PCT)
-        target1 = close * (1 - T1_PCT)
-        target2 = close * (1 - T2_PCT)
+        # ── FILTER 1: Time-of-day ──
+        t = candle_time.time() if hasattr(candle_time, "time") else candle_time
+        if t < dtime(*NO_TRADE_BEFORE) or t > dtime(*NO_TRADE_AFTER):
+            log.info(f"{label}: {direction} skipped — outside trading window ({t})")
+            continue
 
-    risk = abs(close - sl)
-    reward1 = abs(close - target1)
-    rr1 = reward1 / risk if risk > 0 else 0
+        # ── FILTER 2: Cooldown ──
+        cd = cooldown_remaining.get(label, 0)
+        if cd > 0:
+            cooldown_remaining[label] = cd - 1
+            log.info(f"{label}: {direction} skipped — cooldown ({cd} bars left)")
+            continue
 
-    if rr1 < MIN_RR_RATIO:
-        log.info(f"{label}: {direction} skipped — RR {rr1:.2f} below {MIN_RR_RATIO}")
-        return None
+        # ── FILTER 3: 50 EMA trend ──
+        ema_start_idx = max(0, idx - TREND_BARS)
+        ema_trend_vals = df["ema_trend"].iloc[ema_start_idx: idx + 1]
+        trend_slope = 0
+        if len(ema_trend_vals) >= 2:
+            trend_slope = ema_trend_vals.iloc[-1] - ema_trend_vals.iloc[0]
+            if direction == "BUY" and trend_slope <= 0:
+                log.info(f"{label}: BUY skipped — 50 EMA trending down (slope={trend_slope:.2f})")
+                continue
+            if direction == "SELL" and trend_slope >= 0:
+                log.info(f"{label}: SELL skipped — 50 EMA trending up (slope={trend_slope:.2f})")
+                continue
 
-    # Signal strength
-    ema_gap_pct = abs(ema_fast - ema_slow) / ema_slow * 100
-    if ema_gap_pct > 0.3:
-        strength = "STRONG 🔥"
-    elif ema_gap_pct > 0.15:
-        strength = "MODERATE ✅"
-    else:
-        strength = "WEAK ⚠️"
+        # ── Build signal (asymmetric SL/targets) ──
+        if direction == "BUY":
+            sl = close * (1 - SL_PCT)
+            target1 = close * (1 + T1_PCT)
+            target2 = close * (1 + T2_PCT)
+        else:
+            sl = close * (1 + SL_PCT)
+            target1 = close * (1 - T1_PCT)
+            target2 = close * (1 - T2_PCT)
 
-    return {
-        "signal": direction,
-        "direction": "BULLISH" if direction == "BUY" else "BEARISH",
-        "option_type": option_type,
-        "close": close,
-        "sl": sl,
-        "target1": target1,
-        "target2": target2,
-        "rr1": rr1,
-        "rr2": abs(close - target2) / risk if risk > 0 else 0,
-        "ema_fast": ema_fast,
-        "ema_slow": ema_slow,
-        "ema_gap_pct": ema_gap_pct,
-        "strength": strength,
-        "candle_time": candle_time,
-    }
+        risk = abs(close - sl)
+        reward1 = abs(close - target1)
+        rr1 = reward1 / risk if risk > 0 else 0
+
+        if rr1 < MIN_RR_RATIO:
+            log.info(f"{label}: {direction} skipped — RR {rr1:.2f} below {MIN_RR_RATIO}")
+            continue
+
+        # Signal strength
+        ema_gap_pct = abs(ema_fast - ema_slow) / ema_slow * 100
+        if ema_gap_pct > 0.3:
+            strength = "STRONG 🔥"
+        elif ema_gap_pct > 0.15:
+            strength = "MODERATE ✅"
+        else:
+            strength = "WEAK ⚠️"
+
+        log.info(
+            f"{label}: ✅ SIGNAL PASSED ALL FILTERS | {direction} | "
+            f"Close={close:.2f} | Trend slope={trend_slope:.2f} | RR={rr1:.2f}"
+        )
+
+        return {
+            "signal": direction,
+            "direction": "BULLISH" if direction == "BUY" else "BEARISH",
+            "option_type": option_type,
+            "close": close,
+            "sl": sl,
+            "target1": target1,
+            "target2": target2,
+            "rr1": rr1,
+            "rr2": abs(close - target2) / risk if risk > 0 else 0,
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "ema_gap_pct": ema_gap_pct,
+            "strength": strength,
+            "candle_time": candle_time,
+        }
+
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -325,7 +368,7 @@ def send_startup_message():
         "Instruments: <code>NIFTY | BANKNIFTY</code>\n"
         "Market Hours: <code>09:15 – 15:25 IST</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Scanning every 5 minutes. 🎯"
+        f"Scanning every {SCAN_INTERVAL_SECONDS} seconds. 🎯"
     )
     send_telegram(msg)
 
@@ -356,29 +399,32 @@ def run_scan():
         log.info(f"Scanning {label} ({sym})")
         df = fetch_ohlcv(sym)
         if df.empty:
+            log.warning(f"{label}: No data returned from yfinance")
             continue
 
+        log.info(f"{label}: Got {len(df)} completed candles, latest: {df.index[-1]}")
         df = add_indicators(df)
         sig = evaluate_signal(df, label)
 
         if sig is None:
-            log.info(f"{label}: No signal")
+            log.info(f"{label}: No signal this cycle")
             continue
 
-        # Deduplicate
-        sig_key = f"{label}_{sig['signal']}_{sig['candle_time']}"
-        if last_signal.get(label) == sig_key:
-            log.info(f"{label}: Signal already sent, skipping")
+        # Deduplicate: only send one alert per candle time per symbol
+        candle_key = str(sig['candle_time'])
+        if last_signal_time.get(label) == candle_key:
+            log.debug(f"{label}: Signal for candle {candle_key} already sent, skipping")
             continue
 
-        last_signal[label] = sig_key
+        last_signal_time[label] = candle_key
+        log.info(f"🚨 NEW SIGNAL: {label} {sig['signal']} on candle {candle_key}")
 
         # Fetch option chain
         options = get_nse_option_chain(nse_sym)
 
         msg = format_signal_message(label, sig, options)
         send_telegram(msg)
-        log.info(f"Signal sent: {label} {sig['signal']}")
+        log.info(f"✅ Telegram sent: {label} {sig['signal']}")
 
 
 def main():
