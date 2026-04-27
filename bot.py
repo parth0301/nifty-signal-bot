@@ -316,59 +316,74 @@ def send_telegram(message: str):
 
 def format_signal_message(sym_label: str, sig: dict, options: dict) -> str:
     arrow = "🟢" if sig["signal"] == "BUY" else "🔴"
-    opt_sym = f"{sym_label} ATM {sig['option_type']}"
-
-    opt_info = ""
-    if options:
-        atm = options.get("atm_strike", "N/A")
-        ce_ltp = options.get("ce_ltp", "N/A")
-        pe_ltp = options.get("pe_ltp", "N/A")
-        ltp = ce_ltp if sig["option_type"] == "CE" else pe_ltp
-        opt_info = (
-            f"\n\n<b>📋 Options Snapshot</b>"
-            f"\nATM Strike: <code>{atm}</code>"
-            f"\n{sig['option_type']} LTP: <code>₹{ltp}</code>"
-            f"\nExpiry: <code>{options.get('expiry', 'N/A')}</code>"
-        )
-
     ts = sig["candle_time"].strftime("%d %b %Y  %H:%M IST")
 
+    # Build the headline action — e.g. "BUY NIFTY 24500 CE"
+    atm_strike = ""
+    opt_ltp = ""
+    expiry = ""
+    if options:
+        atm_strike = options.get("atm_strike", "")
+        ce_ltp = options.get("ce_ltp", "N/A")
+        pe_ltp = options.get("pe_ltp", "N/A")
+        opt_ltp = ce_ltp if sig["option_type"] == "CE" else pe_ltp
+        expiry = options.get("expiry", "N/A")
+
+    # Clean instrument name (NIFTY 50 → NIFTY)
+    instrument = sym_label.replace(" 50", "")
+
+    # Headline: "BUY NIFTY 24500 CE" or "SELL BANKNIFTY 52000 PE"
+    if atm_strike:
+        action_line = f"{sig['signal']} {instrument} {atm_strike} {sig['option_type']}"
+    else:
+        action_line = f"{sig['signal']} {instrument} {sig['option_type']}"
+
     msg = (
-        f"{arrow} <b>{sig['signal']} SIGNAL — {sym_label}</b> {arrow}\n"
+        f"{arrow}{arrow}{arrow}\n"
+        f"<b>{action_line}</b>\n"
+        f"{arrow}{arrow}{arrow}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱ Candle: <code>{ts}</code>\n"
-        f"📊 Timeframe: 15 Min\n"
-        f"📈 Direction: <b>{sig['direction']}</b>\n"
-        f"💡 Signal Strength: {sig['strength']}\n"
-        f"\n<b>🎯 Entry Zone</b>\n"
-        f"Spot Price: <code>₹{sig['close']:,.2f}</code>\n"
-        f"9 EMA: <code>₹{sig['ema_fast']:,.2f}</code>\n"
-        f"20 EMA: <code>₹{sig['ema_slow']:,.2f}</code>\n"
-        f"EMA Gap: <code>{sig['ema_gap_pct']:.2f}%</code>\n"
-        f"\n<b>🛡 Risk Management</b>\n"
-        f"Stop Loss: <code>₹{sig['sl']:,.2f}</code> ({SL_PCT*100:.1f}%)\n"
-        f"Target 1: <code>₹{sig['target1']:,.2f}</code> ({T1_PCT*100:.2f}%)\n"
-        f"Target 2: <code>₹{sig['target2']:,.2f}</code> ({T2_PCT*100:.1f}%)\n"
-        f"\n<b>🔖 Option to Buy</b>\n"
-        f"{opt_sym}"
-        f"{opt_info}\n"
+        f"⏱ <b>Time:</b> <code>{ts}</code>\n"
+        f"📊 <b>Instrument:</b> <code>{instrument}</code>\n"
+        f"📈 <b>Direction:</b> <code>{sig['direction']}</code>\n"
+        f"💡 <b>Strength:</b> {sig['strength']}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ <i>Signal only — YOU decide the entry. Always manage risk.</i>"
+    )
+
+    # Option details
+    if atm_strike:
+        msg += (
+            f"\n<b>📋 What to Buy</b>\n"
+            f"Strike: <code>{instrument} {atm_strike} {sig['option_type']}</code>\n"
+            f"LTP: <code>₹{opt_ltp}</code>\n"
+            f"Expiry: <code>{expiry}</code>\n"
+        )
+
+    # Entry + SL + Targets
+    msg += (
+        f"\n<b>🎯 Levels</b>\n"
+        f"Entry (Spot): <code>₹{sig['close']:,.2f}</code>\n"
+        f"Stop Loss:    <code>₹{sig['sl']:,.2f}</code>\n"
+        f"Target 1:     <code>₹{sig['target1']:,.2f}</code>\n"
+        f"Target 2:     <code>₹{sig['target2']:,.2f}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ <i>Signal only — manage your own risk.</i>"
     )
     return msg
 
 
 def send_startup_message():
+    now = datetime.now(IST).strftime("%d %b %Y  %H:%M IST")
     msg = (
-        "🤖 <b>NIFTY Signal Bot is LIVE</b>\n"
+        "🤖 <b>Signal Bot is LIVE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ Started: <code>{now}</code>\n"
         f"Strategy: <code>{EMA_FAST}/{EMA_SLOW} EMA + 50 EMA Trend</code>\n"
-        f"SL: <code>{SL_PCT*100:.1f}%</code> | T1: <code>{T1_PCT*100:.2f}%</code> | T2: <code>{T2_PCT*100:.1f}%</code>\n"
-        "Timeframe: <code>15 Minutes</code>\n"
-        "Instruments: <code>NIFTY | BANKNIFTY</code>\n"
+        "Timeframe: <code>15 Min</code>\n"
         "Market Hours: <code>09:15 – 15:25 IST</code>\n"
+        f"Scan Interval: <code>Every {SCAN_INTERVAL_SECONDS // 60} minutes</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"Scanning every {SCAN_INTERVAL_SECONDS} seconds. 🎯"
+        "Waiting for signals... 🎯"
     )
     send_telegram(msg)
 
