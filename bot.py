@@ -446,12 +446,61 @@ def main():
     log.info("Bot starting up...")
     send_startup_message()
 
+    scan_count = 0
+    last_heartbeat_hour = -1
+    first_market_scan_done = False
+
     while True:
         try:
+            now = datetime.now(IST)
+
             if is_market_open():
+                scan_count += 1
+                log.info(f"--- Scan #{scan_count} at {now.strftime('%H:%M:%S IST')} ---")
+
+                # First scan of the day: send diagnostic to Telegram
+                if not first_market_scan_done:
+                    first_market_scan_done = True
+                    diag_msg = (
+                        "🔍 <b>First Scan — Bot Diagnostic</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"⏱ Time: <code>{now.strftime('%d %b %Y  %H:%M IST')}</code>\n"
+                    )
+                    # Quick data check
+                    for cfg in SYMBOLS:
+                        test_df = fetch_ohlcv(cfg["yf_symbol"])
+                        if test_df.empty:
+                            diag_msg += f"❌ <code>{cfg['label']}</code>: No data from yfinance\n"
+                        else:
+                            latest_time = test_df.index[-1]
+                            diag_msg += (
+                                f"✅ <code>{cfg['label']}</code>: {len(test_df)} candles, "
+                                f"latest: <code>{latest_time}</code>\n"
+                            )
+                    diag_msg += (
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "<i>If you see ❌ above, yfinance is blocked on Railway.</i>"
+                    )
+                    send_telegram(diag_msg)
+                    log.info("Sent first-scan diagnostic to Telegram")
+
                 run_scan()
+
+                # Hourly heartbeat (once per hour during market hours)
+                current_hour = now.hour
+                if current_hour != last_heartbeat_hour:
+                    last_heartbeat_hour = current_hour
+                    hb_msg = (
+                        f"💓 <b>Heartbeat</b> — <code>{now.strftime('%H:%M IST')}</code>\n"
+                        f"Scans so far: <code>{scan_count}</code> | Status: <code>Running ✅</code>"
+                    )
+                    send_telegram(hb_msg)
+                    log.info(f"Sent hourly heartbeat (hour={current_hour})")
+
             else:
-                now = datetime.now(IST)
+                # Reset first scan flag at market close so it triggers next day
+                if first_market_scan_done and now.hour >= 16:
+                    first_market_scan_done = False
                 log.info(f"Market closed ({now.strftime('%H:%M IST')}). Sleeping...")
 
             time.sleep(SCAN_INTERVAL_SECONDS)
@@ -460,7 +509,13 @@ def main():
             log.info("Bot stopped by user.")
             break
         except Exception as e:
-            log.error(f"Unexpected error: {e}")
+            log.error(f"Unexpected error: {e}", exc_info=True)
+            # Send error to Telegram so user knows something broke
+            try:
+                err_msg = f"🚨 <b>Bot Error</b>\n<code>{str(e)[:200]}</code>"
+                send_telegram(err_msg)
+            except:
+                pass
             time.sleep(30)
 
 
